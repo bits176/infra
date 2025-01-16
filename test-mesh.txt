@@ -1,0 +1,16 @@
+
+kubectl --kubeconfig ~/.kube/cluster1-cluster apply -f echo-server-cluster1.yaml
+
+kubectl --kubeconfig ~/.kube/cluster2-cluster apply -f test-client.yaml
+
+kubectl --kubeconfig ~/.kube/cluster2-cluster exec -it test-client -n test-app -- sh
+
+/ # wget -qO- echo-server.test-app.svc.cluster.local
+Request served by echo-server-66cfd777f4-9cn8p
+
+GET / HTTP/1.1
+
+Host: echo-server.test-app.svc.cluster.local
+Connection: close
+User-Agent: Wget
+/ # 

@@ -1,0 +1,58 @@
+clusters:
+  - name: cluster1
+    id: 01
+    kubernetes_version: "1.32"
+    pod_network_cidr: "10.218.0.0/16"
+    nodes:
+      - name: "cluster1-k8s-master"
+        cpus: 2
+        memory: 2G
+        disk: 10G
+      - name: "cluster1-k8s-worker-1"
+        cpus: 2
+        memory: 4G
+        disk: 10G
+      - name: "cluster1-k8s-worker-2"
+        cpus: 2
+        memory: 4G
+        disk: 10G
+  - name: cluster2
+    id: 02
+    kubernetes_version: "1.32"
+    pod_network_cidr: "10.219.0.0/16"
+    nodes:
+      - name: "cluster2-k8s-master"
+        cpus: 2
+        memory: 2G
+        disk: 10G
+      - name: "cluster2-k8s-worker-1"
+        cpus: 2
+        memory: 4G
+        disk: 10G
+      - name: "cluster2-k8s-worker-2"
+        cpus: 2
+        memory: 4G
+        disk: 10G
+#  - name: cluster3
+#    id: 03
+#    kubernetes_version: "1.32"
+#    pod_network_cidr: "10.220.0.0/16"
+#    nodes:
+#      - name: "cluster3-k8s-master"
+#        cpus: 2
+#        memory: 2G
+#        disk: 10G
+#      - name: "cluster3-k8s-worker-1"
+#        cpus: 2
+#        memory: 4G
+#        disk: 10G
+#      - name: "cluster3-k8s-worker-2"
+#        cpus: 2
+#        memory: 4G
+#        disk: 10G
+
+clusterMesh:
+  - meshName: mesh1
+    clusters: 
+      - cluster1
+      - cluster2

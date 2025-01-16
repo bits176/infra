@@ -1,0 +1,191 @@
+# Manual steps to provision 3 node cluster with cilium cni
+
+######### Create VMs
+multipass launch --name k8s-master --cpus 2 --memory 2G --disk 10G &
+multipass launch --name k8s-worker-1 --cpus 2 --memory 4G --disk 10G &
+multipass launch --name k8s-worker-2 --cpus 2 --memory 4G --disk 10G &
+
+######### Update /etc/hosts file in an idempotent way
+# Get IPs
+MASTER_IP=$(multipass info k8s-master | grep IPv4 | awk '{print $2}')
+WORKER1_IP=$(multipass info k8s-worker-1 | grep IPv4 | awk '{print $2}')
+WORKER2_IP=$(multipass info k8s-worker-2 | grep IPv4 | awk '{print $2}')
+
+# Update hosts file
+HOSTS_FILE="/etc/hosts"
+
+# Remove existing k8s entries
+sudo sed -i '' '/k8s-master/d' "$HOSTS_FILE"
+sudo sed -i '' '/k8s-worker-1/d' "$HOSTS_FILE"
+sudo sed -i '' '/k8s-worker-2/d' "$HOSTS_FILE"
+
+# Add new entries
+HOSTS_ENTRIES=(
+    "$MASTER_IP k8s-master"
+    "$WORKER1_IP k8s-worker-1"
+    "$WORKER2_IP k8s-worker-2"
+)
+
+for entry in "${HOSTS_ENTRIES[@]}"; do
+    echo "$entry" | sudo tee -a "$HOSTS_FILE"
+done
+
+######### add local Mac's public key to node's authorized_keys
+multipass exec k8s-master -- bash -c "echo '$(cat ~/.ssh/id_rsa.pub)' >> ~/.ssh/authorized_keys"
+multipass exec k8s-worker-1 -- bash -c "echo '$(cat ~/.ssh/id_rsa.pub)' >> ~/.ssh/authorized_keys"
+multipass exec k8s-worker-2 -- bash -c "echo '$(cat ~/.ssh/id_rsa.pub)' >> ~/.ssh/authorized_keys"
+
+
+
+######### Add/Update kubernetes apt repo
+multipass exec k8s-master -- bash -c 'echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.32/deb/ /" | sudo tee /etc/apt/sources.list.d/kubernetes.list'
+multipass exec k8s-master -- bash -c 'curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.32/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg'
+
+multipass exec k8s-worker-2 -- bash -c 'echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.32/deb/ /" | sudo tee /etc/apt/sources.list.d/kubernetes.list'
+multipass exec k8s-worker-2 -- bash -c 'curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.32/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg'
+
+multipass exec k8s-worker-1 -- bash -c 'echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.32/deb/ /" | sudo tee /etc/apt/sources.list.d/kubernetes.list'
+multipass exec k8s-worker-1 -- bash -c 'curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.32/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg'
+
+
+
+######### Install necessary packages and kubeadm, kubelet, and kubectl on all nodes
+multipass exec k8s-master -- bash -c 'sudo apt-get update && sudo apt-get install -y apt-transport-https ca-certificates curl && sudo apt-get install -y kubelet kubeadm kubectl && sudo apt-mark hold kubelet kubeadm kubectl'
+multipass exec k8s-worker-1 -- bash -c 'sudo apt-get update && sudo apt-get install -y apt-transport-https ca-certificates curl && sudo apt-get install -y kubelet kubeadm kubectl && sudo apt-mark hold kubelet kubeadm kubectl'
+multipass exec k8s-worker-2 -- bash -c 'sudo apt-get update && sudo apt-get install -y apt-transport-https ca-certificates curl && sudo apt-get install -y kubelet kubeadm kubectl && sudo apt-mark hold kubelet kubeadm kubectl'
+
+######### Enable IP forwarding on all nodes
+multipass exec k8s-master -- bash -c '[[ ! $(grep "net.ipv4.ip_forward" /etc/sysctl.conf) ]] && echo "net.ipv4.ip_forward = 1" | sudo tee -a /etc/sysctl.conf; sudo sysctl -w net.ipv4.ip_forward=1'
+multipass exec k8s-worker-1 -- bash -c '[[ ! $(grep "net.ipv4.ip_forward" /etc/sysctl.conf) ]] && echo "net.ipv4.ip_forward = 1" | sudo tee -a /etc/sysctl.conf; sudo sysctl -w net.ipv4.ip_forward=1'
+multipass exec k8s-worker-2 -- bash -c '[[ ! $(grep "net.ipv4.ip_forward" /etc/sysctl.conf) ]] && echo "net.ipv4.ip_forward = 1" | sudo tee -a /etc/sysctl.conf; sudo sysctl -w net.ipv4.ip_forward=1'
+
+######### Ensure br_netfilter module is loaded and verify on all nodes
+multipass exec k8s-master -- bash -c 'sudo modprobe br_netfilter && echo "br_netfilter" | sudo tee /etc/modules-load.d/k8s.conf && lsmod | grep br_netfilter'
+multipass exec k8s-worker-1 -- bash -c 'sudo modprobe br_netfilter && echo "br_netfilter" | sudo tee /etc/modules-load.d/k8s.conf && lsmod | grep br_netfilter'
+multipass exec k8s-worker-2 -- bash -c 'sudo modprobe br_netfilter && echo "br_netfilter" | sudo tee /etc/modules-load.d/k8s.conf && lsmod | grep br_netfilter'
+
+######### Ensure required sysctl params are set on all nodes
+multipass exec k8s-master -- bash -c '[[ ! $(grep "net.bridge.bridge-nf-call-iptables" /etc/sysctl.conf) ]] && echo "net.bridge.bridge-nf-call-iptables = 1" | sudo tee -a /etc/sysctl.conf; sudo sysctl -p'
+multipass exec k8s-worker-1 -- bash -c '[[ ! $(grep "net.bridge.bridge-nf-call-iptables" /etc/sysctl.conf) ]] && echo "net.bridge.bridge-nf-call-iptables = 1" | sudo tee -a /etc/sysctl.conf; sudo sysctl -p'
+multipass exec k8s-worker-2 -- bash -c '[[ ! $(grep "net.bridge.bridge-nf-call-iptables" /etc/sysctl.conf) ]] && echo "net.bridge.bridge-nf-call-iptables = 1" | sudo tee -a /etc/sysctl.conf; sudo sysctl -p'
+
+######### Install containerd and runc on all nodes
+NODES=("k8s-master" "k8s-worker-1" "k8s-worker-2")
+
+for node in "${NODES[@]}"; do
+    echo "Installing containerd and runc on $node..."
+    
+    multipass exec "$node" -- sudo bash -c '
+        curl -fsSL https://download.docker.com/linux/debian/gpg | sudo apt-key add -
+        echo "deb [arch=arm64] https://download.docker.com/linux/debian buster stable" | sudo tee /etc/apt/sources.list.d/docker.list
+        sudo apt update
+        sudo apt install -y containerd
+
+        wget https://github.com/opencontainers/runc/releases/download/v1.2.4/runc.arm64
+        sudo install -m 755 runc.arm64 /usr/local/sbin/runc
+    '
+done
+
+######### Enable and start kubelet service on all nodes
+multipass exec k8s-master -- bash -c 'sudo systemctl enable kubelet && sudo systemctl start kubelet'
+multipass exec k8s-worker-1 -- bash -c 'sudo systemctl enable kubelet && sudo systemctl start kubelet'
+multipass exec k8s-worker-2 -- bash -c 'sudo systemctl enable kubelet && sudo systemctl start kubelet'
+
+#########Configure containerd to use systemd cgroup driver
+NODES=("k8s-master" "k8s-worker-1" "k8s-worker-2")
+
+for node in "${NODES[@]}"; do
+    echo "Updating containerd config on $node..."
+    
+    multipass exec "$node" -- sudo bash -c '
+        # Install containerd if not present
+        if ! command -v containerd >/dev/null 2>&1; then
+            apt-get update
+            apt-get install -y containerd
+        fi
+
+
+        # Remove old config and create fresh
+        rm -f /etc/containerd/config.toml
+        mkdir -p /etc/containerd
+        containerd config default > /etc/containerd/config.toml
+
+        # Set SystemdCgroup to true
+        sed -i "s/SystemdCgroup = false/SystemdCgroup = true/" /etc/containerd/config.toml
+
+        # Enable and restart containerd
+        systemctl enable containerd
+        systemctl restart containerd
+    '
+
+    # Verify configuration
+    echo "Verifying config on $node:"
+    multipass exec "$node" -- sudo grep -A 12 "runc.options" /etc/containerd/config.toml
+done
+
+######### Configure kubelet to use systemd cgroup driver
+
+NODES=("k8s-master" "k8s-worker-1" "k8s-worker-2")
+
+for node in "${NODES[@]}"; do
+    echo "Configuring kubelet on $node..."
+    
+    multipass exec "$node" -- sudo bash -c '
+        KUBELET_CONF="/etc/default/kubelet"
+        SETTING="KUBELET_EXTRA_ARGS=--cgroup-driver=systemd"
+        
+        # Create file if it doesnt exist
+        mkdir -p /etc/default
+        touch $KUBELET_CONF
+        
+        # Check if setting already exists and is correct
+        if grep -q "^KUBELET_EXTRA_ARGS=.*cgroup-driver=systemd" "$KUBELET_CONF"; then
+            echo "Correct setting already exists"
+        else
+            # Remove any existing KUBELET_EXTRA_ARGS lines
+            sed -i "/^KUBELET_EXTRA_ARGS=/d" "$KUBELET_CONF"
+            # Add new setting
+            echo "$SETTING" >> "$KUBELET_CONF"
+            # Reload and restart services
+            systemctl daemon-reload
+            systemctl restart kubelet
+        fi
+    '
+done
+
+######### Create crictl configuration file on all nodes
+multipass exec k8s-master -- bash -c 'echo "runtime-endpoint: unix:///var/run/containerd/containerd.sock
+image-endpoint: unix:///var/run/containerd/containerd.sock
+timeout: 10
+debug: false" | sudo tee /etc/crictl.yaml'
+
+multipass exec k8s-worker-1 -- bash -c 'echo "runtime-endpoint: unix:///var/run/containerd/containerd.sock
+image-endpoint: unix:///var/run/containerd/containerd.sock
+timeout: 10
+debug: false" | sudo tee /etc/crictl.yaml'
+
+multipass exec k8s-worker-2 -- bash -c 'echo "runtime-endpoint: unix:///var/run/containerd/containerd.sock
+image-endpoint: unix:///var/run/containerd/containerd.sock
+timeout: 10
+debug: false" | sudo tee /etc/crictl.yaml'
+
+######### Initialize Kubernetes master node
+multipass exec k8s-master -- bash -c 'sudo kubeadm init --pod-network-cidr=10.244.0.0/16'
+
+######### Set up kubeconfig for the master node
+multipass exec k8s-master -- bash -c 'mkdir -p $HOME/.kube && sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config && sudo chown $(id -u):$(id -g) $HOME/.kube/config'
+
+######### Copy kubeconfig file from master node to local machine
+multipass exec k8s-master -- sudo cat /etc/kubernetes/admin.conf > kubeconfig
+mkdir -p ~/.kube
+mv kubeconfig ~/.kube/homelab
+export KUBECONFIG=~/.kube/homelab
+
+######### Install a pod network add-on (Cilium) using Helm
+helm repo remove cilium && helm repo add cilium https://helm.cilium.io/ && helm upgrade --install cilium cilium/cilium --version 1.16.5 --namespace kube-system --set kubeProxyReplacement=true --set hubble.relay.enabled=true --set hubble.ui.enabled=true'
+
+######### Join worker nodes to the cluster
+JOIN_COMMAND=$(multipass exec k8s-master -- bash -c 'kubeadm token create --print-join-command')
+multipass exec k8s-worker-1 -- bash -c "sudo $JOIN_COMMAND"
+multipass exec k8s-worker-2 -- bash -c "sudo $JOIN_COMMAND"
+

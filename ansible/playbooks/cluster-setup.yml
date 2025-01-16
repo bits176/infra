@@ -1,0 +1,87 @@
+---
+- name: Setup Kubernetes Clusters
+  hosts: localhost
+  vars_files:
+    - ../env/clusters.yml
+
+  tasks:
+    - name: Setup each cluster
+      include_role:
+        name: cluster
+      loop: "{{ clusters }}"
+      loop_control:
+        loop_var: cluster
+
+- name: Install Cilium on each cluster
+  hosts: localhost
+  vars_files:
+    - ../env/clusters.yml
+
+  tasks:
+    - name: Install a pod network add-on (Cilium) using Cilium CLI
+      shell: |
+        KUBECONFIG=~/.kube/{{ cluster.name }}-cluster cilium install --set cluster.name={{ cluster.name }} --set cluster.id={{ cluster.id }}
+      loop: "{{ clusters }}"
+      loop_control:
+        loop_var: cluster
+    - name: Enable Hubble UI on each cluster
+      shell: |
+        KUBECONFIG=~/.kube/{{ cluster.name }}-cluster cilium hubble enable --ui
+      loop: "{{ clusters }}"
+      loop_control:
+        loop_var: cluster
+      
+- name: Setup Cluster Mesh
+  hosts: localhost
+  vars_files:
+    - ../env/clusters.yml
+
+  tasks:
+    - name: Rename clusters, contexts, and users in kubeconfig
+      shell: |
+        sed -i '' 's/name: kubernetes/name: {{ cluster.name }}/g' ~/.kube/{{ cluster.name }}-cluster
+        sed -i '' 's/cluster: kubernetes/cluster: {{ cluster.name }}/g' ~/.kube/{{ cluster.name }}-cluster
+        sed -i '' 's/name: kubernetes-admin@kubernetes/name: {{ cluster.name }}-admin@{{ cluster.name }}/g' ~/.kube/{{ cluster.name }}-cluster
+        sed -i '' 's/user: kubernetes-admin/user: {{ cluster.name }}-admin/g' ~/.kube/{{ cluster.name }}-cluster
+        sed -i '' 's/current-context: kubernetes-admin@kubernetes/current-context: {{ cluster.name }}-admin@kubernetes/g' ~/.kube/{{ cluster.name }}-cluster
+      loop: "{{ clusters }}"
+      loop_control:
+        loop_var: cluster
+      delegate_to: localhost
+
+    - name: Set KUBECONFIG environment variable
+      set_fact:
+        kubeconfig_value: "{{ clusters | map(attribute='name') | map('regex_replace', '^', '~/.kube/') | map('regex_replace', '$', '-cluster') | join(':') }}"
+
+    - debug:
+        var: kubeconfig_value
+
+    - name: Merge kubeconfig files
+      shell: |
+        export KUBECONFIG={{ kubeconfig_value }}
+        kubectl config view --flatten > ~/.kube/merged-kubeconfig
+      delegate_to: localhost
+
+    - name: Enable cluster mesh on each cluster
+      shell: |
+        KUBECONFIG=~/.kube/merged-kubeconfig cilium clustermesh enable --context {{ item }}-admin@kubernetes --service-type=NodePort
+      loop: "{{ clusterMesh | map(attribute='clusters') | flatten | unique }}"
+      loop_control:
+        loop_var: item
+      delegate_to: localhost
+
+    - name: Connect clusters using Cilium CLI
+      shell: |
+        KUBECONFIG=~/.kube/merged-kubeconfig cilium clustermesh connect --context {{ item }}-admin@kubernetes --destination-context {{ item2 }}-admin@kubernetes
+      loop: "{{ clusterMesh }}"
+      loop_control:
+        loop_var: mesh
+      delegate_to: localhost
+      vars:
+        item: "{{ mesh.clusters[0] }}"
+        item2: "{{ mesh.clusters[1] }}"
+
+    - name: Wait for cluster mesh to be ready
+      shell: |
+        KUBECONFIG=~/.kube/merged-kubeconfig cilium clustermesh status --context {{ clusters[0].name }}-admin@kubernetes --wait
+      delegate_to: localhost
