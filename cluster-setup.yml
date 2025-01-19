@@ -3,6 +3,7 @@
   hosts: localhost
   vars:
     kubernetes_version: "1.32"
+    pod_network_cidr: "10.218.0.0/16"
     nodes:
       - name: "{{ cluster_name }}-k8s-master"
         cpus: 2
@@ -51,10 +52,10 @@
       retries: 30
       delay: 10
 
-    - name: Wait a bit ...
-      shell: sleep 30
-      delegate_to: localhost
-      run_once: true
+#    - name: Wait a bit ...
+#      shell: sleep 10
+#      delegate_to: localhost
+#      run_once: true
 
     # Phase 2: Network Setup
     - name: Get VM IPs
@@ -143,10 +144,10 @@
       delegate_to: "{{ item.name }}"
       remote_user: ubuntu
 
-    - name: Wait a bit ...
-      shell: sleep 15
-      delegate_to: localhost
-      run_once: true
+#    - name: Wait a bit ...
+#      shell: sleep 10
+#      delegate_to: localhost
+#      run_once: true
 
     # Phase 5: Kubernetes Prerequisites
     - name: Enable IP forwarding
@@ -203,10 +204,10 @@
       delegate_to: "{{ item.name }}"
       remote_user: ubuntu
 
-    - name: Wait a bit ...
-      shell: sleep 20
-      delegate_to: localhost
-      run_once: true
+#    - name: Wait a bit ...
+#      shell: sleep 10
+#      delegate_to: localhost
+#      run_once: true
 
     - name: Configure containerd to use systemd cgroup driver
       shell: |
@@ -259,8 +260,8 @@
         # Reset if previous init failed
         sudo kubeadm reset -f
         
-        # Run init with proper settings (matching working manual setup)
-        sudo kubeadm init --pod-network-cidr=10.244.0.0/16
+        # Run init with proper settings (matching working manual setup) and skip kube-proxy
+        sudo kubeadm init --pod-network-cidr={{ pod_network_cidr }} --skip-phases=addon/kube-proxy
         until sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf get nodes; do
           echo "Waiting for control plane..."
           sleep 5
@@ -273,10 +274,10 @@
       delay: 30
       become: true
 
-    - name: Wait a bit ...
-      shell: sleep 30
-      delegate_to: localhost
-      run_once: true
+#    - name: Wait a bit ...
+#      shell: sleep 10
+#      delegate_to: localhost
+#      run_once: true
 
     - name: Set up kubeconfig for the master node
       shell: |
@@ -302,6 +303,11 @@
       delegate_to: "{{ cluster_name }}-k8s-master"
       remote_user: ubuntu
 
+    - name: Get master node IP
+      shell: multipass info {{ cluster_name }}-k8s-master | grep IPv4 | awk '{print $2}'
+      register: master_ip
+      delegate_to: localhost
+
     - name: Install Helm on master node
       shell: |
         if ! command -v helm >/dev/null 2>&1; then
@@ -313,9 +319,16 @@
 
     - name: Install a pod network add-on (Cilium) using Helm
       shell: |
-        helm repo remove cilium
         helm repo add cilium https://helm.cilium.io/
-        helm upgrade --install cilium cilium/cilium --version 1.16.5 --namespace kube-system --set kubeProxyReplacement=true --set hubble.relay.enabled=true --set hubble.ui.enabled=true
+        helm repo update
+        helm upgrade --install cilium cilium/cilium --version 1.16.5 --namespace kube-system \
+          --set kubeProxyReplacement=true \
+          --set hubble.relay.enabled=true \
+          --set hubble.ui.enabled=true \
+          --set ipam.mode=cluster-pool \
+          --set ipam.operator.clusterPoolIPv4PodCIDRList={{ pod_network_cidr }} \
+          --set k8sServiceHost={{ master_ip.stdout }} \
+          --set k8sServicePort=6443
       delegate_to: "{{ cluster_name }}-k8s-master"
       remote_user: ubuntu
 
