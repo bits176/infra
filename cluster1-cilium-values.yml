@@ -1,0 +1,36 @@
+cluster:
+  id: 01                               # <= this is cluster ID and must be unique for each cluster
+  name: cluster1                      # <= this is cluster name and must be unique for each cluster
+clustermesh:
+  apiserver:
+    service:
+      type: NodePort                   # ClusterMesh API is exposed using NodePort (in my case - for simplicity). All Cilium pods from all other clusters
+      nodePort: 32379                  # will try to reach this endpoint based on settings in {clustermesh.config.clusters[].address/port}
+    tls:
+      authMode: cluster                # authMode if all clusters sharing the same CA
+      server:
+        extraDnsNames:
+          - "*.bits.mac"               # To properly generate certificate you MUST specify your domain here, otherwise you will get "authentication handshake failed"
+  config:                              # since all certificates are generated for domain *mesh.cilium.io by default.
+    enabled: true
+    domain: bits.mac                   # Domain must be the same for all clusters
+    clusters:                          # List with all clusters connected to Cluster Mesh
+      - name: cluster2                # Cluster name of the second cluster
+        address: cluster2-k8s-master.bits.mac  # Hostname with clustermesh API service exposed
+        port: 32380                    # Port for Clustermesh API. So cilium agents on k8s01 cluster should be able to curl https://k8s-lab-02.mypc.loc:32380
+  useAPIServer: true
+kubeProxyReplacement: true
+hubble:
+  relay:
+    enabled: true
+  ui:
+    enabled: true
+ipam:
+  mode: cluster-pool
+  operator:
+    clusterPoolIPv4PodCIDRList:
+      - "10.217.0.0/16"                # Replace with your actual pod network CIDR
+k8sServiceHost: "cluster1-k8s-master.bits.mac"  # Replace with the actual master node hostname
+k8sServicePort: 6443
+externalWorkloads:
+  enabled: true

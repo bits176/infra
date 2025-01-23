@@ -1,0 +1,35 @@
+---
+- name: Setup Cluster Mesh
+  hosts: localhost
+  vars_files:
+    - env/clusters.yml
+
+  tasks:
+    - name: Enable cluster mesh on each cluster
+      shell: |
+        KUBECONFIG=~/.kube/{{ item }}-cluster cilium clustermesh enable --service-type=NodePort
+      loop: "{{ clusterMesh }}"
+      delegate_to: localhost
+
+    - name: Merge kubeconfig files
+      shell: |
+        export KUBECONFIG=$(echo ~/.kube/{{ clusters | map(attribute='name') | join('-cluster:~/.kube/') }}-cluster)
+        kubectl config view --flatten > ~/.kube/merged-kubeconfig      
+      delegate_to: localhost
+
+    - name: Connect clusters using Cilium CLI
+      shell: |
+        cilium clustermesh connect --context kubernetes-admin@{{ item }} --destination-context kubernetes-admin@{{ item2 }}
+      loop: "{{ clusterMesh }}"
+      loop_control:
+        loop_var: item
+        index_var: index
+      delegate_to: localhost
+      when: item != clusterMesh[-1]
+      vars:
+        item2: "{{ clusterMesh[index + 1] }}"
+
+    - name: Wait for cluster mesh to be ready
+      shell: |
+        cilium clustermesh status --wait
+      delegate_to: localhost

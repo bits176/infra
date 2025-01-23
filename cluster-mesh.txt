@@ -1,0 +1,41 @@
+helm upgrade cilium cilium/cilium --namespace kube-system \
+  --set cluster.id=1 \
+  --set cluster.name=cluster1 \
+  --set clustermesh.useAPIServer=true \
+  --set clustermesh.apiserver.service.type=ClusterIP \
+  --set clustermesh.apiserver.tls.auto.certManager=true \
+  --set externalWorkloads.enabled=true \
+  --kubeconfig ~/.kube/cluster1-cluster
+
+helm upgrade cilium cilium/cilium --namespace kube-system \
+  --set cluster.id=2 \
+  --set cluster.name=cluster2 \
+  --set clustermesh.useAPIServer=true \
+  --set clustermesh.apiserver.service.type=ClusterIP \
+  --set clustermesh.apiserver.tls.auto.certManager=true \
+  --set externalWorkloads.enabled=true \
+  --kubeconfig ~/.kube/cluster2-cluster
+
+kubectl --kubeconfig ~/.kube/cluster1-cluster -n kube-system get secret -l io.cilium.k8s.policy.cluster=cluster-1 -o yaml > cluster-1-secrets.yaml
+kubectl --kubeconfig ~/.kube/cluster2-cluster -n kube-system get secret -l io.cilium.k8s.policy.cluster=cluster-2 -o yaml > cluster-2-secrets.yaml
+
+
+
+
+
+helm upgrade cilium cilium/cilium --namespace kube-system \
+  --set cluster.id=1 \
+  --set cluster.name=cluster1 \
+  --set clustermesh.useAPIServer=true \
+  --set clustermesh.apiserver.tls.auto.certManager=true \
+  --kubeconfig ~/.kube/cluster1-cluster
+
+helm upgrade cilium cilium/cilium --namespace kube-system \
+  --set cluster.id=2 \
+  --set cluster.name=cluster2 \
+  --set clustermesh.useAPIServer=true \
+  --set clustermesh.apiserver.tls.auto.certManager=true \
+  --kubeconfig ~/.kube/cluster2-cluster
+
+kubectl --kubeconfig ~/.kube/cluster1-cluster get secret -n kube-system cilium-ca -o yaml | \
+  kubectl --kubeconfig ~/.kube/cluster2-cluster replace -f - --force

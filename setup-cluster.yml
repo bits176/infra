@@ -1,0 +1,296 @@
+---
+- name: Fail if cluster_name is not defined
+  fail:
+    msg: "The variable 'cluster_name' is required."
+  when: cluster.name is not defined
+
+- name: Clean DHCP lease entries
+  shell: |
+    sudo sed -i '' '/{/,/}/ { /name={{ item.name }}/,/}/d; }' /var/db/dhcpd_leases
+  loop: "{{ cluster.nodes }}"
+  
+- name: Remove existing SSH known_hosts entries
+  shell: |
+    ssh-keygen -R {{ item.name }}.local
+  loop: "{{ cluster.nodes }}"
+
+# Phase 1: VM Setup
+- name: Launch VMs in parallel
+  shell: |
+    if ! multipass list | grep -q {{ item.name }}; then
+      multipass launch --name {{ item.name }} --cpus {{ item.cpus }} --memory {{ item.memory }} --disk {{ item.disk }}
+    fi
+  loop: "{{ cluster.nodes }}"
+  async: 300
+  poll: 0
+
+- name: Wait for VMs
+  shell: |
+    until multipass info {{ item.name }} | grep -q "Running"; do sleep 5; done
+  loop: "{{ cluster.nodes }}"
+  register: vm_status
+  until: vm_status is succeeded
+  retries: 30
+  delay: 10
+
+# Phase 2: SSH Setup
+- name: Get VM IPs
+  shell: multipass info {{ item.name }} | grep IPv4 | awk '{print $2}'
+  loop: "{{ cluster.nodes }}"
+  register: node_ips
+
+- name: Ensure SSH key is set for ubuntu user using multipass
+  shell: |
+    multipass exec {{ item.name }} -- bash -c "echo '{{ lookup('file', '~/.ssh/id_rsa.pub') }}' >> /home/ubuntu/.ssh/authorized_keys"
+  loop: "{{ cluster.nodes }}"
+  delegate_to: localhost
+
+- name: Wait for SSH to be available
+  wait_for:
+    host: "{{ item.stdout }}"
+    port: 22
+    delay: 5
+    timeout: 180
+  loop: "{{ node_ips.results }}"
+  delegate_to: localhost
+
+- name: Add host keys to known_hosts
+  shell: |
+    ssh-keyscan {{ item.stdout }} >> ~/.ssh/known_hosts
+  loop: "{{ node_ips.results }}"
+  delegate_to: localhost
+
+# Phase 3: Network Setup
+- name: Install avahi-daemon
+  shell: |
+    sudo apt-get update
+    sudo apt-get install -y avahi-daemon
+    sudo systemctl enable avahi-daemon
+    sudo systemctl start avahi-daemon
+  loop: "{{ node_ips.results }}"
+  delegate_to: "{{ item.stdout }}"
+  remote_user: ubuntu
+
+# Phase 4: Package Installation
+- name: Create keyrings directory
+  file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: '0755'
+  become: true
+  loop: "{{ cluster.nodes }}"
+  delegate_to: "{{ item.name }}.local"
+  remote_user: ubuntu
+
+- name: Add Kubernetes GPG key
+  shell: |
+    curl -fsSL https://pkgs.k8s.io/core:/stable:/v{{ cluster.kubernetes_version }}/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+  become: true
+  loop: "{{ cluster.nodes }}"
+  delegate_to: "{{ item.name }}.local"
+  remote_user: ubuntu
+  args:
+    creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+- name: Add Kubernetes repository
+  shell: |
+    echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v{{ cluster.kubernetes_version }}/deb/ /" | sudo tee /etc/apt/sources.list.d/kubernetes.list
+  become: true
+  loop: "{{ cluster.nodes }}"
+  delegate_to: "{{ item.name }}.local"
+  remote_user: ubuntu
+
+- name: Install necessary packages and Kubernetes tools
+  shell: |
+    while sudo fuser /var/lib/apt/lists/lock >/dev/null 2>&1; do
+      echo "Waiting for other apt-get process to finish..."
+      sleep 5
+    done
+    sudo apt-get update
+    sudo apt-get install -y apt-transport-https ca-certificates curl
+    if ! dpkg -l | grep -q kubelet; then
+      sudo apt-get install -y kubelet kubeadm kubectl
+      sudo apt-mark hold kubelet kubeadm kubectl
+    fi
+  loop: "{{ cluster.nodes }}"
+  delegate_to: "{{ item.name }}.local"
+  remote_user: ubuntu
+
+# Phase 5: Kubernetes Prerequisites
+- name: Enable IP forwarding
+  shell: |
+    if ! grep -q "net.ipv4.ip_forward = 1" /etc/sysctl.conf; then
+      echo "net.ipv4.ip_forward = 1" | sudo tee -a /etc/sysctl.conf
+      sudo sysctl -w net.ipv4.ip_forward=1
+    fi
+  loop: "{{ cluster.nodes }}"
+  delegate_to: "{{ item.name }}.local"
+  remote_user: ubuntu
+
+- name: Ensure br_netfilter module is loaded
+  shell: |
+    if ! lsmod | grep -q br_netfilter; then
+      sudo modprobe br_netfilter
+      echo "br_netfilter" | sudo tee /etc/modules-load.d/k8s.conf
+    fi
+  loop: "{{ cluster.nodes }}"
+  delegate_to: "{{ item.name }}.local"
+  remote_user: ubuntu
+
+- name: Ensure required sysctl params are set
+  shell: |
+    if ! grep -q "net.bridge.bridge-nf-call-iptables = 1" /etc/sysctl.conf; then
+      echo "net.bridge.bridge-nf-call-iptables = 1" | sudo tee -a /etc/sysctl.conf
+      sudo sysctl -p
+    fi
+  loop: "{{ cluster.nodes }}"
+  delegate_to: "{{ item.name }}.local"
+  remote_user: ubuntu
+
+- name: Install containerd and runc
+  shell: |
+    if ! dpkg -l | grep -q containerd; then
+      curl -fsSL https://download.docker.com/linux/debian/gpg | sudo apt-key add -
+      echo "deb [arch=arm64] https://download.docker.com/linux/debian buster stable" | sudo tee /etc/apt/sources.list.d/docker.list
+      sudo apt update
+      sudo apt install -y containerd
+    fi
+    if ! command -v runc >/dev/null 2>&1; then
+      wget https://github.com/opencontainers/runc/releases/download/v1.2.4/runc.arm64
+      sudo install -m 755 runc.arm64 /usr/local/sbin/runc
+    fi
+  loop: "{{ cluster.nodes }}"
+  delegate_to: "{{ item.name }}.local"
+  remote_user: ubuntu
+
+- name: Enable and start kubelet service
+  shell: |
+    sudo systemctl enable kubelet
+    sudo systemctl start kubelet
+  loop: "{{ cluster.nodes }}"
+  delegate_to: "{{ item.name }}.local"
+  remote_user: ubuntu
+
+- name: Configure containerd to use systemd cgroup driver
+  shell: |
+    if ! grep -q "SystemdCgroup = true" /etc/containerd/config.toml; then
+      sudo rm -f /etc/containerd/config.toml
+      sudo mkdir -p /etc/containerd
+      sudo containerd config default | sudo tee /etc/containerd/config.toml > /dev/null
+      sudo sed -i "s/SystemdCgroup = false/SystemdCgroup = true/" /etc/containerd/config.toml
+      sudo systemctl enable containerd
+      sudo systemctl restart containerd
+    fi
+  loop: "{{ cluster.nodes }}"
+  delegate_to: "{{ item.name }}.local"
+  remote_user: ubuntu
+  become: true
+
+- name: Configure kubelet to use systemd cgroup driver
+  shell: |
+    KUBELET_CONF="/etc/default/kubelet"
+    SETTING="KUBELET_EXTRA_ARGS=--cgroup-driver=systemd"
+    sudo mkdir -p /etc/default
+    sudo touch $KUBELET_CONF
+    if ! grep -q "^KUBELET_EXTRA_ARGS=.*cgroup-driver=systemd" "$KUBELET_CONF"; then
+      sudo sed -i "/^KUBELET_EXTRA_ARGS=/d" "$KUBELET_CONF"
+      echo "$SETTING" | sudo tee -a "$KUBELET_CONF"
+      sudo systemctl daemon-reload
+      sudo systemctl restart kubelet
+    fi
+  loop: "{{ cluster.nodes }}"
+  delegate_to: "{{ item.name }}.local"
+  remote_user: ubuntu
+
+- name: Create crictl configuration file
+  copy:
+    dest: /etc/crictl.yaml
+    content: |
+      runtime-endpoint: unix:///var/run/containerd/containerd.sock
+      image-endpoint: unix:///var/run/containerd/containerd.sock
+      timeout: 10
+      debug: false
+    mode: '0644'
+  become: true
+  loop: "{{ cluster.nodes }}"
+  delegate_to: "{{ item.name }}.local"
+  remote_user: ubuntu
+
+# Phase 6: Cluster Setup
+- name: Initialize Kubernetes master node
+  shell: |
+    # Reset if previous init failed
+    sudo kubeadm reset -f
+    
+    # Run init with proper settings (matching working manual setup) and skip kube-proxy
+    sudo kubeadm init --pod-network-cidr={{ cluster.pod_network_cidr }} --skip-phases=addon/kube-proxy --apiserver-cert-extra-sans=*.local
+    until sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf get nodes; do
+      echo "Waiting for control plane..."
+      sleep 5
+    done
+  delegate_to: "{{ cluster.name }}-k8s-master.local"
+  remote_user: ubuntu
+  register: init_result
+  until: init_result.rc == 0
+  retries: 3
+  delay: 30
+  become: true
+
+- name: Set up kubeconfig for the master node
+  shell: |
+    if [ -f /etc/kubernetes/admin.conf ]; then
+      mkdir -p $HOME/.kube
+      sudo cp /etc/kubernetes/admin.conf $HOME/.kube/config
+      sudo chown $(id -u):$(id -g) $HOME/.kube/config
+    fi
+  delegate_to: "{{ cluster.name }}-k8s-master.local"
+  remote_user: ubuntu
+
+- name: Copy kubeconfig file from master node to local machine
+  fetch:
+    src: /etc/kubernetes/admin.conf
+    dest: "{{ lookup('env', 'HOME') }}/.kube/{{ cluster.name }}-cluster"
+    flat: yes
+  delegate_to: "{{ cluster.name }}-k8s-master.local"
+  remote_user: ubuntu
+  become: true
+
+- name: Set KUBECONFIG environment variable
+  shell: |
+    export KUBECONFIG="${HOME}/.kube/{{ cluster.name }}-cluster"
+  delegate_to: localhost
+
+- name: Wait for Kubernetes API server to be accessible
+  shell: |
+    sleep 30
+    until curl -k https://127.0.0.1:6443/version; do sleep 5; done
+  delegate_to: "{{ cluster.name }}-k8s-master.local"
+  remote_user: ubuntu
+
+- name: Get master node IP
+  shell: multipass info {{ cluster.name }}-k8s-master | grep IPv4 | awk '{print $2}'
+  register: master_ip
+  delegate_to: localhost
+
+- name: Get join command from master
+  shell: |
+    sudo kubeadm token create --print-join-command
+  delegate_to: "{{ cluster.name }}-k8s-master.local"
+  remote_user: ubuntu
+  register: join_command
+
+- name: Join worker nodes to the cluster
+  shell: |
+    sudo {{ join_command.stdout }}
+  loop: "{{ cluster.nodes[1:] }}"
+  delegate_to: "{{ item.name }}.local"
+  remote_user: ubuntu
+
+- name: Install Helm on master node
+  shell: |
+    if ! command -v helm >/dev/null 2>&1; then
+      curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+    fi
+  delegate_to: "{{ cluster.name }}-k8s-master.local"
+  remote_user: ubuntu
+  become: true
